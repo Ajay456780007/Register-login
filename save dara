@@ -1,0 +1,249 @@
+function Save_data(n_bus, n, out0, out1, out2, out3, out4, out5, out6, out7, ff, n_op)
+% Save_data: Gather outputs from out0..out7, call perf_est_all per-variable,
+%            save CSVs and generate individual plots with plot_all.
+%
+% Inputs (kept same as your previous signature). Inside the function set:
+%   saveResults = true/false  -> whether to write CSVs & images
+%   showPlots   = true/false  -> whether to open figure windows
+%
+% Important: this Save_data calls plot_all explicitly for each variable so you
+%            have maximal control over plotting type (bar/line) and mode.
+
+% ----------------- USER CONFIG -----------------
+saveResults = true;   % <--- set to false to skip saving files
+showPlots   = true;   % <--- set to false to suppress popups
+outDir = 'Results';
+if saveResults && ~exist(outDir,'dir'), mkdir(outDir); end
+
+% Column/model names (must match the number of outs: 8)
+col_names = ["Base Case", "PSO Optimization", "GOA Optimization", "EGWO-PSO Optimization", ...
+             "GWO Optimization", "Fire Fly Optimization", "Moth Flame Optimization", "Hybrid Optimization"];
+
+outs = {out0,out1,out2,out3,out4,out5,out6,out7};
+nModels = numel(outs);
+
+% Helper: safe field getter - returns column vector (length may vary)
+    function vec = get_field_col(k, fieldName)
+        vec = [];
+        if k > numel(outs) || isempty(outs{k})
+            vec = [];
+            return;
+        end
+        s = outs{k};
+        if isfield(s, fieldName)
+            val = s.(fieldName);
+            % Convert to column numeric vector if possible
+            if isnumeric(val)
+                vec = val(:);
+            else
+                % try to convert logical/cell -> numeric
+                try
+                    vec = cell2mat(val);
+                    vec = vec(:);
+                catch
+                    vec = [];
+                end
+            end
+        else
+            vec = [];
+        end
+    end
+
+% ----------------- VARIABLE LIST -----------------
+% We'll explicitly process each variable and call plot_all per variable
+varsToProcess = { ...
+    'Ploss', 'Qloss', 'Ploss_branch', 'Qloss_branch', ...
+    'T_power_loss', 'PL', 'QL', ...
+    'voltage', 'Voltage_dev','Voltage_min','Voltage_max','angle_all', ...
+    'AVDI','AVSI','best_dg_pos','best_dg_pow','ATC_per_bus','trans_efficiency','temp_uncertainty'};
+
+% Loop through variables and build matrices or per-bus vectors
+for v = 1:numel(varsToProcess)
+    varName = varsToProcess{v};
+    try
+        % Collect per-model values
+        collected = cell(nModels,1);
+        maxLen = 0;
+        isScalar = true;
+        for k = 1:nModels
+            vec = get_field_col(k, varName);
+            if isempty(vec)
+                % if field absent, create empty
+                vec = [];
+            end
+            collected{k} = vec;
+            maxLen = max(maxLen, numel(vec));
+            if numel(vec) ~= 1
+                isScalar = false;
+            end
+        end
+
+        % SPECIAL HANDLING: best_dg_pos & best_dg_pow -> expand to per-bus arrays
+        if strcmpi(varName, 'best_dg_pos') || strcmpi(varName, 'best_dg_pow')
+            % Build per-bus matrix [n_bus x nModels]
+            mat = zeros(n_bus, nModels);
+            for k = 1:nModels
+                posVec = get_field_col(k, 'best_dg_pos');    % positions (indices)
+                powVec = get_field_col(k, 'best_dg_pow');    % powers (same length)
+                if isempty(posVec)
+                    continue;
+                end
+                posVec = round(posVec(:));
+                % if best_dg_pow available, map powers. else put 1 at pos for presence
+                if ~isempty(powVec)
+                    powVec = powVec(:);
+                    % If number of powers equals positions, map one-to-one
+                    mlen = min(numel(posVec), numel(powVec));
+                    for ii = 1:mlen
+                        p = posVec(ii);
+                        if p>=1 && p<=n_bus
+                            mat(p,k) = powVec(ii);
+                        end
+                    end
+                else
+                    % mark presence with 1
+                    for ii = 1:numel(posVec)
+                        p = posVec(ii);
+                        if p>=1 && p<=n_bus
+                            mat(p,k) = 1;
+                        end
+                    end
+                end
+            end
+            % Save CSV and plot: comparative across models (grouped bars), x-axis = buses
+            csvFile = fullfile(outDir, sprintf('%s_data.csv', varName));
+            if saveResults
+                T = array2table(mat, 'VariableNames', cellstr(col_names));
+                writetable(T, csvFile);
+            end
+            % Comparative grouped bar (per-bus)
+            plot_all((1:n_bus)', mat, cellstr(col_names), 'bar', 'comparative', ...
+                     sprintf('%s_comparative', varName), 'Bus Number', varName, saveResults, showPlots, outDir, 'comparative_bar');
+            % Performance: we can plot Hybrid column only
+            plot_all((1:n_bus)', mat(:,end), {col_names(end)}, 'bar', 'performance', ...
+                     sprintf('%s_performance_hybrid', varName), 'Bus Number', varName, saveResults, showPlots, outDir, 'performance_bar');
+            continue;
+        end
+
+        % If scalar for all models -> comparative across models is single-row
+        allLengths = cellfun(@numel, collected);
+        if all(allLengths == 1)
+            % comparative table: 1-row with 8 columns (models)
+            row = nan(1, nModels);
+            for k = 1:nModels
+                vval = collected{k};
+                if isempty(vval)
+                    row(k) = NaN;
+                else
+                    row(k) = collected{k};
+                end
+            end
+            % run perf_est_all on 1xN row as a single-row matrix
+            % perf_est_all expects rows x cols, so transpose to be 1 x nModels
+            perfRow = perf_est_all(row, varName);
+
+            % Save CSV
+            csvFile = fullfile(outDir, sprintf('%s_data.csv', varName));
+            if saveResults
+                T = array2table(perfRow, 'VariableNames', cellstr(col_names));
+                writetable(T, csvFile);
+            end
+
+            % Comparative: x-axis is model index (1..nModels)
+            xModels = 1:nModels;
+            legendNames = cellstr(col_names);
+            plot_all(xModels', perfRow', legendNames, 'bar', 'comparative', ...
+                     sprintf('%s_comparative', varName), 'Model Index', varName, saveResults, showPlots, outDir, 'comparative_bar');
+
+            % Performance: Hybrid value only (plot single bar)
+            plot_all(1, perfRow(end), {col_names(end)}, 'bar', 'performance', ...
+                     sprintf('%s_performance_hybrid', varName), 'Hybrid', varName, saveResults, showPlots, outDir, 'performance_bar');
+
+            continue;
+        end
+
+        % For per-bus variables: build matrix rows = buses (or element count), cols = models
+        % If different model vectors have various lengths, pad with NaN up to maxLen (or n_bus)
+        rowsTarget = max(maxLen, n_bus);
+        mat = NaN(rowsTarget, nModels);
+        for k = 1:nModels
+            v = collected{k};
+            if isempty(v)
+                continue;
+            end
+            v = v(:);
+            L = numel(v);
+            % If L < rowsTarget, pad bottom with NaN
+            mat(1:L,k) = v;
+        end
+
+        % Now call perf_est_all which expects rows x cols
+        perfMat = perf_est_all(mat, varName);
+
+        % Save CSV
+        csvFile = fullfile(outDir, sprintf('%s_data.csv', varName));
+        if saveResults
+            % create table with columns as model names, rows as element indices
+            T = array2table(perfMat, 'VariableNames', cellstr(col_names));
+            writetable(T, csvFile);
+        end
+
+        % Decide plot type per variable (user-specified heuristics)
+        if contains(lower(varName), {'ploss','qloss','branch'})
+            pType = 'bar';
+        elseif contains(lower(varName), {'voltage','angle','dev'})
+            pType = 'line';
+        elseif contains(lower(varName), {'atc','trans_efficiency','avsi','avdi'})
+            pType = 'bar';
+        else
+            pType = 'line';
+        end
+
+        % Comparative plot: rows = x (e.g. buses), columns = models
+        xVals = (1:rowsTarget)';
+        plot_all(xVals, perfMat, cellstr(col_names), pType, 'comparative', ...
+                 sprintf('%s_comparative', varName), 'Index', varName, saveResults, showPlots, outDir, 'comparative');
+
+        % Performance plot: Hybrid only (last column)
+        hybridVec = perfMat(:, end);
+        plot_all(xVals, hybridVec, {char(col_names(end))}, pType, 'performance', ...
+                 sprintf('%s_performance_hybrid', varName), 'Index', varName, saveResults, showPlots, outDir, 'performance');
+
+    catch ME
+        warning('Save_data: error processing %s -> %s', varName, ME.message);
+    end
+end
+
+% OPTIONAL: create a summary CSV of Hybrid vs best-other improvements
+try
+    summaryRows = {};
+    for v = 1:numel(varsToProcess)
+        varName = varsToProcess{v};
+        % read saved CSV if exists
+        fname = fullfile(outDir, sprintf('%s_data.csv', varName));
+        if exist(fname,'file')
+            T = readtable(fname);
+            % last column is Hybrid
+            hybridVals = T{:,end};
+            % compute average improvement vs mean of other columns where numeric
+            others = T{:,1:end-1};
+            meanOthers = mean(others,2,'omitnan');
+            % compute improvement depending direction
+            if contains(lower(varName), {'ploss','qloss','loss','uncertainty','temp'})
+                % improvement percent = (meanOther - hybrid)/meanOther *100
+                imp = mean((meanOthers - hybridVals)./max(meanOthers,eps)) * 100;
+            else
+                imp = mean((hybridVals - meanOthers)./max(meanOthers,eps)) * 100;
+            end
+            summaryRows(end+1,:) = {varName, imp}; %#ok<SAGROW>
+        end
+    end
+    if ~isempty(summaryRows)
+        summaryT = cell2table(summaryRows, 'VariableNames', {'Variable','Hybrid_pct_improvement'});
+        writetable(summaryT, fullfile(outDir,'summary_hybrid_improvement.csv'));
+    end
+catch
+    % ignore summary errors
+end
+
+end
